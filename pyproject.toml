@@ -1,0 +1,10 @@
+[project]
+name = "framiton"
+version = "0.1.0"
+description = "Research video annotation tool for Japanese Sign Language fingerspelling"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "opencv-python>=4.10.0",
+    "PySide6>=6.8.0",
+]

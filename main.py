@@ -3,19 +3,28 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
+import re
 import sys
 import time
-from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
+from threading import Event
 
 import cv2
-from PySide6.QtCore import QProcess, Qt, QTimer, Signal
+from PySide6.QtCore import QProcess, QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QSlider,
-    QSpinBox, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
+    QPushButton, QRadioButton, QSlider, QSpinBox, QStackedWidget, QVBoxLayout,
+    QWidget,
+)
+
+from frame_export import (
+    ExportResult, ResolvedRange, execute_export, export_directory_for, frame_index_at_pts,
+    resolve_frame_range, resolve_time_range, source_metadata_for,
 )
 
 APP_DIR = Path(__file__).parent
@@ -30,9 +39,12 @@ class PtsProbeProcess(QProcess):
     def __init__(self, path: Path, frame_count: int, parent=None):
         super().__init__(parent)
         self.path = path
+        stat = path.stat()
+        self.file_identity = {"size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
         self.frame_count = frame_count
         self.started_at = time.perf_counter()
-        self.timestamps: list[float] = []
+        self.timestamps: list[float | None] = []
+        self.frame_durations: list[float | None] = []
         self.pending_line = bytearray()
         self.invalid_output = False
         self.finished_once = False
@@ -46,7 +58,7 @@ class PtsProbeProcess(QProcess):
     def start_probe(self):
         self.start("ffprobe", [
             "-v", "error", "-select_streams", "v:0", "-show_frames",
-            "-show_entries", "frame=best_effort_timestamp_time", "-of", "csv=p=0",
+            "-show_entries", "frame=best_effort_timestamp_time,pkt_duration_time", "-of", "csv=p=0",
             str(self.path),
         ])
         self.timeout.start(30_000)
@@ -58,19 +70,32 @@ class PtsProbeProcess(QProcess):
         for line in lines: self._parse_line(line)
 
     def _parse_line(self, line: bytes):
-        value = line.strip().split(b",", 1)[0]
-        if not value or value == b"N/A": return
-        try: self.timestamps.append(float(value))
-        except ValueError: self.invalid_output = True
+        fields = line.strip().split(b",")
+        if not fields or not fields[0]: return
+        if fields[0] == b"N/A":
+            self.timestamps.append(None)
+        else:
+            try: self.timestamps.append(float(fields[0]))
+            except ValueError:
+                self.timestamps.append(None); self.invalid_output = True
+        duration = None
+        if len(fields) > 1 and fields[1] and fields[1] != b"N/A":
+            try: duration = float(fields[1])
+            except ValueError: self.invalid_output = True
+        self.frame_durations.append(duration)
 
     def _on_finished(self, exit_code: int, _exit_status):
         self._collect_output()
         if self.pending_line:
             self._parse_line(bytes(self.pending_line)); self.pending_line.clear()
-        timestamps = self.timestamps if exit_code == 0 and not self.invalid_output else None
-        if timestamps is not None and (len(timestamps) != self.frame_count or any(b < a for a, b in zip(timestamps, timestamps[1:]))):
-            timestamps = None
-        self._complete(timestamps)
+        result = None
+        if exit_code == 0 and self.timestamps:
+            result = {
+                "timestamps": list(self.timestamps),
+                "frame_durations": list(self.frame_durations),
+                "invalid_output": self.invalid_output,
+            }
+        self._complete(result)
 
     def _on_error(self, error):
         if error == QProcess.ProcessError.FailedToStart:
@@ -110,6 +135,8 @@ class VideoSource:
 
     def __init__(self, path: Path):
         self.path = path
+        stat = path.stat()
+        self.file_identity = {"size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
         self.capture = cv2.VideoCapture(str(path))
         if not self.capture.isOpened():
             raise RuntimeError(f"動画を開けません: {path}")
@@ -120,34 +147,80 @@ class VideoSource:
             raise RuntimeError("動画のFPSまたは総フレーム数を取得できませんでした。")
         self.pts_times = [i / self.fps for i in range(self.frame_count)]
         self.pts_available = False
+        self.probed_pts_times: list[float | None] | None = None
+        self.probed_frame_durations: list[float | None] | None = None
+        self.pts_mapping_reliable = False
+        self.pts_warning: str | None = None
         self.vfr: bool | None = None
+        self.duration_seconds = self.frame_count / self.fps
+        self.duration_method = "OpenCV frame count / FPS (approximate)"
+        self.width = int(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = int(self.capture.get(cv2.CAP_PROP_FOURCC))
+        self.codec = "".join(chr((fourcc >> (8 * i)) & 0xff) for i in range(4)).strip("\x00 ") or "unknown"
+        self.container = self.path.suffix.lstrip(".").lower() or "unknown"
         self._next_frame_index = -1
 
     @staticmethod
-    def parse_pts(output: str | bytes, expected_frames: int) -> list[float] | None:
+    def parse_pts(output: str | bytes, expected_frames: int | None = None) -> list[float | None] | None:
         if isinstance(output, bytes): output = output.decode("utf-8", errors="replace")
         try:
             times = []
             for line in output.splitlines():
                 value = line.strip().split(",", 1)[0]
-                if value and value != "N/A": times.append(float(value))
-            if len(times) != expected_frames or len(times) < 2:
-                return None
-            if any(b < a for a, b in zip(times, times[1:])):
+                if not value: continue
+                times.append(None if value == "N/A" else float(value))
+            if not times:
                 return None
             return times
         except ValueError:
             return None
 
-    def set_presentation_times(self, timestamps: list[float]) -> bool:
-        if len(timestamps) != self.frame_count or any(b < a for a, b in zip(timestamps, timestamps[1:])):
+    def set_presentation_times(self, timestamps: list[float | None], durations: list[float | None] | None = None) -> bool:
+        if not timestamps:
             return False
-        self.pts_times = timestamps
+        self.probed_pts_times = list(timestamps)
+        self.probed_frame_durations = list(durations or [])
         self.pts_available = True
-        deltas = [b - a for a, b in zip(timestamps, timestamps[1:]) if b > a]
+        monotonic = all(b is not None and a is not None and b >= a for a, b in zip(timestamps, timestamps[1:]))
+        complete = len(timestamps) == self.frame_count and all(value is not None for value in timestamps)
+        self.pts_mapping_reliable = complete and monotonic
+        if not self.pts_mapping_reliable:
+            reasons = []
+            if len(timestamps) != self.frame_count:
+                reasons.append(f"PTS decoded-frame count {len(timestamps)} differs from OpenCV frame count {self.frame_count}")
+            if not all(value is not None for value in timestamps): reasons.append("some decoded frames have no PTS")
+            if not monotonic: reasons.append("PTS values are non-monotonic")
+            self.pts_warning = "; ".join(reasons) or "PTS-to-frame mapping is unreliable"
+            self.vfr = None
+            self.duration_seconds = None
+            self.duration_method = "unknown (PTS mapping unreliable)"
+            return True
+
+        exact_times = [float(value) for value in timestamps]
+        self.pts_times = exact_times
+        deltas = [b - a for a, b in zip(exact_times, exact_times[1:])]
         expected = 1.0 / self.fps
-        self.vfr = bool(deltas) and max(abs(delta - expected) for delta in deltas) > max(0.0005, expected * 0.02)
+        self.vfr = None if len(exact_times) < 2 else max(abs(delta - expected) for delta in deltas) > max(0.0005, expected * 0.02)
+        last_duration = self.probed_frame_durations[-1] if self.probed_frame_durations else None
+        if last_duration is not None and last_duration > 0:
+            self.duration_seconds = exact_times[-1] + last_duration - exact_times[0]
+            self.duration_method = "first PTS through last PTS + last packet duration"
+        elif self.vfr is False:
+            self.duration_seconds = self.frame_count / self.fps
+            self.duration_method = "CFR frame count / FPS"
+        else:
+            self.duration_seconds = exact_times[-1] - exact_times[0]
+            self.duration_method = "PTS span; final frame duration unavailable"
+            self.pts_warning = "final frame duration unavailable; timestamps after final PTS cannot be selected"
         return True
+
+    def resolve_time_range(self, start: str, end: str) -> ResolvedRange:
+        return resolve_time_range(
+            start, end,
+            self.probed_pts_times, self.frame_count, self.pts_mapping_reliable,
+            self.duration_seconds,
+        )
 
     def frame(self, index: int):
         index = max(0, min(self.frame_count - 1, index))
@@ -288,6 +361,176 @@ class TagDialog(QDialog):
         if tag == "fingerspelling": self.character.setCurrentText(character)
 
 
+class FrameExportThread(QThread):
+    progress = Signal(int, int, int)
+    completed = Signal(object)
+
+    def __init__(self, source_path: Path, output_directory: Path, metadata: dict,
+                 resolved: ResolvedRange, operation_id: str, cancel_event: Event, parent=None):
+        super().__init__(parent)
+        self.source_path = source_path
+        self.output_directory = output_directory
+        self.metadata = metadata
+        self.resolved = resolved
+        self.operation_id = operation_id
+        self.cancel_event = cancel_event
+
+    def run(self):
+        result = execute_export(self.source_path, self.output_directory, self.metadata,
+                                self.resolved, self.operation_id, self.cancel_event,
+                                self.progress.emit)
+        self.completed.emit(result)
+
+
+class FrameExportDialog(QDialog):
+    def __init__(self, video: VideoSource, parent=None):
+        super().__init__(parent)
+        self.video = video
+        self.source_path = video.path
+        self.output_directory = export_directory_for(video.path)
+        self.cancel_event = Event()
+        self.worker: FrameExportThread | None = None
+        self.result: ExportResult | None = None
+        self.setWindowTitle("フレーム書き出し")
+        self.resize(560, 300)
+
+        layout = QVBoxLayout(self)
+        self.frame_mode = QRadioButton("フレーム番号で指定 (0始まり・両端を含む)")
+        self.time_mode = QRadioButton("時刻で指定 (HH:MM:SS.ffffff・両端のPTSを含む)")
+        self.frame_mode.setChecked(True)
+        layout.addWidget(self.frame_mode); layout.addWidget(self.time_mode)
+        self.mode_stack = QStackedWidget()
+        frame_page = QWidget(); frame_form = QFormLayout(frame_page)
+        self.frame_start = QSpinBox(); self.frame_end = QSpinBox()
+        self.frame_start.setRange(0, max(0, video.frame_count - 1))
+        self.frame_end.setRange(0, max(0, video.frame_count - 1))
+        self.frame_end.setValue(max(0, video.frame_count - 1))
+        frame_form.addRow("Start frame", self.frame_start); frame_form.addRow("End frame", self.frame_end)
+        time_page = QWidget(); time_form = QFormLayout(time_page)
+        self.time_start = QLineEdit("00:00:00.000"); self.time_end = QLineEdit("00:00:01.000")
+        time_form.addRow("Start time", self.time_start); time_form.addRow("End time", self.time_end)
+        self.mode_stack.addWidget(frame_page); self.mode_stack.addWidget(time_page)
+        layout.addWidget(self.mode_stack)
+        self.frame_mode.toggled.connect(lambda checked: self.mode_stack.setCurrentIndex(0 if checked else 1))
+        self.destination = QLabel(str(self.output_directory)); self.destination.setWordWrap(True)
+        layout.addWidget(QLabel("出力先")); layout.addWidget(self.destination)
+        self.pts_notice = QLabel()
+        self.pts_notice.setWordWrap(True)
+        self._refresh_pts_notice()
+        layout.addWidget(self.pts_notice)
+        self.progress = QProgressBar(); self.progress.hide(); layout.addWidget(self.progress)
+        self.status = QLabel("時刻指定は元動画先頭からの相対時刻です。")
+        layout.addWidget(self.status)
+        self.buttons = QDialogButtonBox()
+        self.export_button = self.buttons.addButton("書き出し", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.cancel_button = self.buttons.addButton("閉じる", QDialogButtonBox.ButtonRole.RejectRole)
+        self.export_button.clicked.connect(self.start_export)
+        self.cancel_button.clicked.connect(self.cancel_or_close)
+        layout.addWidget(self.buttons)
+
+    def _refresh_pts_notice(self):
+        if self.video.pts_mapping_reliable:
+            detail = "PTSと元フレーム番号の対応は利用可能です。"
+        else:
+            detail = f"時刻指定は無効です: {self.video.pts_warning or 'PTS解析が未完了、または対応が不完全です。'}"
+        self.pts_notice.setText(detail)
+        self.time_mode.setEnabled(self.video.pts_mapping_reliable)
+
+    def _set_running(self, running: bool):
+        for widget in (self.frame_mode, self.time_mode, self.frame_start, self.frame_end,
+                       self.time_start, self.time_end, self.export_button):
+            widget.setEnabled(not running)
+        self.progress.setVisible(running)
+        self.cancel_button.setText("キャンセル" if running else "閉じる")
+
+    def start_export(self):
+        try:
+            if not self.source_path.is_file():
+                raise ValueError("ソース動画が見つからないか、アクセスできません")
+            current_stat = self.source_path.stat()
+            identity = {"size_bytes": current_stat.st_size, "mtime_ns": current_stat.st_mtime_ns}
+            if identity != self.video.file_identity:
+                raise ValueError("動画ファイルが読み込み後に変更されました。動画を開き直してください")
+            if self.frame_mode.isChecked():
+                pts = self.video.probed_pts_times if self.video.pts_mapping_reliable else None
+                resolved = resolve_frame_range(self.frame_start.value(), self.frame_end.value(),
+                                               self.video.frame_count, pts)
+            else:
+                resolved = self.video.resolve_time_range(self.time_start.text(), self.time_end.text())
+            writable_target = self.output_directory if self.output_directory.exists() else self.output_directory.parent
+            if not writable_target.is_dir() or not os.access(writable_target, os.W_OK):
+                raise ValueError(f"出力先フォルダーに書き込めません: {writable_target}")
+            metadata_path = self.output_directory / "export_metadata.txt"
+            if metadata_path.exists():
+                try:
+                    existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    if not isinstance(existing, dict) or not isinstance(existing.get("export_history"), list):
+                        raise ValueError("形式が不正です")
+                except (OSError, ValueError) as exc:
+                    raise ValueError(f"既存メタデータを安全に読み込めません: {exc}") from exc
+            source_metadata = source_metadata_for(self.source_path, self.video)
+            answer = QMessageBox.question(self, "書き出しの確認",
+                f"{resolved.total_frames:,}フレームをPNGで書き出します。\n{self.output_directory}\n\n既存ファイルは上書きせずスキップします。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes: return
+        except Exception as exc:
+            QMessageBox.warning(self, "範囲を確認してください", str(exc)); return
+
+        self.progress.setRange(0, resolved.total_frames); self.progress.setValue(0)
+        self.status.setText("書き出し中…")
+        self._set_running(True)
+        self.cancel_event.clear()
+        self.worker = FrameExportThread(self.source_path, self.output_directory,
+            source_metadata, resolved, str(uuid4()),
+            self.cancel_event, self)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.completed.connect(self.on_completed)
+        self.worker.start()
+
+    def on_progress(self, done: int, total: int, frame_index: int):
+        self.progress.setValue(done)
+        self.status.setText(f"フレーム {frame_index:,} を処理中 ({done:,}/{total:,})")
+
+    def on_completed(self, result: ExportResult):
+        self.result = result
+        self._set_running(False)
+        details = [f"新規書き出し: {result.exported:,}", f"既存のためスキップ: {result.skipped:,}",
+                   f"失敗: {result.failed:,}", f"キャンセル: {'あり' if result.cancelled else 'なし'}",
+                   f"メタデータ保存: {'成功' if result.metadata_saved else '失敗'}"]
+        details.extend(result.errors)
+        self.status.setText("\n".join(details))
+        self.export_button.setEnabled(False)
+        self.cancel_button.setText("閉じる")
+
+    def cancel_or_close(self):
+        if self.worker and self.worker.isRunning():
+            self.cancel_event.set()
+            self.cancel_button.setEnabled(False)
+            self.status.setText("キャンセル処理中…")
+        else:
+            self.accept()
+
+    def accept(self):
+        if self.worker and self.worker.isRunning():
+            return
+        super().accept()
+
+    def reject(self):
+        if self.worker and self.worker.isRunning():
+            self.cancel_event.set()
+            self.status.setText("キャンセル処理中…")
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.cancel_event.set()
+            event.ignore()
+            return
+        event.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -303,6 +546,7 @@ class MainWindow(QMainWindow):
         self.playback_started_at = 0.0
         self.playback_started_pts = 0.0
         self.pts_probe: PtsProbeProcess | None = None
+        self.export_dialog: FrameExportDialog | None = None
         self.characters = load_characters()
         self.timer = QTimer(self); self.timer.timeout.connect(self.advance_playback)
 
@@ -312,7 +556,9 @@ class MainWindow(QMainWindow):
         self.csv_button = QPushButton("CSV読み込み"); self.csv_button.clicked.connect(self.open_csv)
         self.save_button = QPushButton("保存"); self.save_button.clicked.connect(self.save_csv)
         self.save_as_button = QPushButton("名前を付けて保存"); self.save_as_button.clicked.connect(self.save_csv_as)
-        for button in (self.open_button, self.csv_button, self.save_button, self.save_as_button): toolbar.addWidget(button)
+        self.export_button = QPushButton("フレーム書き出し")
+        self.export_button.clicked.connect(self.open_frame_export)
+        for button in (self.open_button, self.csv_button, self.save_button, self.save_as_button, self.export_button): toolbar.addWidget(button)
         toolbar.addStretch(); outer.addLayout(toolbar)
 
         self.preview = QLabel("動画を開いてください")
@@ -405,18 +651,27 @@ class MainWindow(QMainWindow):
         if self.pts_probe is probe: self.pts_probe = None
         if probe: probe.deleteLater()
         if not self.video or path != self.video.path: return
-        if timestamps is not None and self.video.set_presentation_times(timestamps):
-            if self.timer.isActive():
+        if timestamps is not None and self.video.set_presentation_times(
+                timestamps["timestamps"], timestamps["frame_durations"]):
+            if timestamps.get("invalid_output"):
+                warning = "FFprobe出力に一部解釈できない値があります"
+                self.video.pts_warning = f"{self.video.pts_warning}; {warning}" if self.video.pts_warning else warning
+            if self.video.pts_mapping_reliable and self.timer.isActive():
                 self.reset_playback_clock(); self.timer.start(1)
             self._update_video_status()
-            self.refresh()
+            if self.export_dialog:
+                self.export_dialog._refresh_pts_notice()
+            if self.video.pts_mapping_reliable: self.refresh()
         else:
+            self.video.pts_warning = "FFprobeで利用可能なdecoded-frame PTSを取得できませんでした"
             self._update_video_status("判定不能 (FPSで再生)")
 
     def _update_video_status(self, fallback: str | None = None):
         if not self.video: return
         if fallback:
             status = fallback
+        elif self.video.pts_warning:
+            status = f"⚠ PTS注意: {self.video.pts_warning}"
         elif self.video.vfr is True:
             status = "⚠ VFR検出: FPSは平均値です (フレーム間隔が一定ではありません)"
         elif self.video.vfr is False:
@@ -526,7 +781,7 @@ class MainWindow(QMainWindow):
         elapsed = time.perf_counter() - self.playback_started_at
         target_pts = self.playback_started_pts + elapsed * speed
         timestamps = self.video.pts_times
-        target_index = min(self.video.frame_count - 1, max(self.frame_index, bisect_right(timestamps, target_pts) - 1))
+        target_index = max(self.frame_index, frame_index_at_pts(timestamps, target_pts))
         if target_index != self.frame_index:
             self.frame_index = target_index
             self.refresh()
@@ -641,6 +896,14 @@ class MainWindow(QMainWindow):
         if candidates:
             self.frame_index = candidates[-1] if direction < 0 else candidates[0]
             self.refresh()
+
+    def open_frame_export(self):
+        if not self.video:
+            QMessageBox.information(self, "フレーム書き出し", "先に動画を開いてください。")
+            return
+        self.export_dialog = FrameExportDialog(self.video, self)
+        self.export_dialog.exec()
+        self.export_dialog = None
 
 
 def main():
